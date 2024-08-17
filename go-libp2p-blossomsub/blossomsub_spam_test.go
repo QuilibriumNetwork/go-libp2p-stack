@@ -123,7 +123,7 @@ func TestBlossomSubAttackSpamIWANT(t *testing.T) {
 			iwantlst := [][]byte{DefaultMsgIdFn(msg)}
 			iwant := []*pb.ControlIWant{{MessageIDs: iwantlst}}
 			orpc := rpcWithControl(nil, nil, iwant, nil, nil)
-			writeMsg(&orpc.RPC)
+			writeMsg(orpc.RPC)
 		}
 	})
 
@@ -197,6 +197,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 	newMockBS(ctx, t, attacker, func(writeMsg func(*pb.RPC), irpc *pb.RPC) {
 		// When the legit host connects it will send us its subscriptions
 		for _, sub := range irpc.GetSubscriptions() {
+			sub := sub
 			if sub.GetSubscribe() {
 				// Reply by subcribing to the bitmask and grafting to the peer
 				writeMsg(&pb.RPC{
@@ -216,7 +217,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 						ihavelst := [][]byte{[]byte("someid" + strconv.Itoa(i))}
 						ihave := []*pb.ControlIHave{{Bitmask: sub.Bitmask, MessageIDs: ihavelst}}
 						orpc := rpcWithControl(nil, ihave, nil, nil, nil)
-						writeMsg(&orpc.RPC)
+						writeMsg(orpc.RPC)
 					}
 
 					select {
@@ -246,7 +247,7 @@ func TestBlossomSubAttackSpamIHAVE(t *testing.T) {
 						ihavelst := [][]byte{[]byte("someid" + strconv.Itoa(i+100))}
 						ihave := []*pb.ControlIHave{{Bitmask: sub.Bitmask, MessageIDs: ihavelst}}
 						orpc := rpcWithControl(nil, ihave, nil, nil, nil)
-						writeMsg(&orpc.RPC)
+						writeMsg(orpc.RPC)
 					}
 
 					select {
