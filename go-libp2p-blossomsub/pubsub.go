@@ -26,13 +26,19 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 )
 
-// DefaultMaximumMessageSize is 1 MB.
-const DefaultMaxMessageSize = 1 << 20
+// DefaultSoftMaxMessageSize is 1 MiB.
+const DefaultSoftMaxMessageSize = 1 << 20
+
+// DefaultHardMaxMessageSize is 20 MB.
+const DefaultHardMaxMessageSize = 10 << 21
+
+// DefaultPeerOutboundQueueSize is the default size of the outbound message channel that we maintain for each peer.
+const DefaultPeerOutboundQueueSize = 128
 
 var (
 	// TimeCacheDuration specifies how long a message ID will be remembered as seen.
 	// Use WithSeenMessagesTTL to configure this per pubsub instance, instead of overriding the global default.
-	TimeCacheDuration = 120 * time.Second
+	TimeCacheDuration = 1 * time.Hour
 
 	// TimeCacheStrategy specifies which type of lookup/cleanup strategy is used by the seen messages cache.
 	// Use WithSeenMessagesStrategy to configure this per pubsub instance, instead of overriding the global default.
@@ -68,9 +74,12 @@ type PubSub struct {
 
 	peerFilter PeerFilter
 
-	// maxMessageSize is the maximum message size; it applies globally to all
-	// bitmasks.
-	maxMessageSize int
+	// softMaxMessageSize is the maximum size of a single message fragment that
+	// we will attempt to send.
+	softMaxMessageSize int
+	// hardMaxMessageSize is the maximum size of a single message fragment that
+	// we will accept.
+	hardMaxMessageSize int
 
 	// size of the outbound message channel that we maintain for each peer
 	peerOutboundQueueSize int
@@ -150,8 +159,8 @@ type PubSub struct {
 	blacklist     Blacklist
 	blacklistPeer chan peer.ID
 
-	peers   map[peer.ID]chan *RPC
-	peersMx sync.RWMutex
+	peerMx sync.RWMutex
+	peers  map[peer.ID]*rpcQueue
 
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]network.Stream
@@ -203,11 +212,14 @@ type PubSubRouter interface {
 	// EnoughPeers returns whether the router needs more peers before it's ready to publish new records.
 	// Suggested (if greater than 0) is a suggested number of peers that the router should need.
 	EnoughPeers(bitmask []byte, suggested int) bool
-	// AcceptFrom is invoked on any incoming message before pushing it to the validation pipeline
+	// AcceptFrom is invoked on any RPC envelope before pushing it to the validation pipeline
 	// or processing control information.
 	// Allows routers with internal scoring to vet peers before committing any processing resources
 	// to the message and implement an effective graylist and react to validation queue overload.
 	AcceptFrom(peer.ID) AcceptStatus
+	// PreValidation is invoked on messages in the RPC envelope right before pushing it to
+	// the validation pipeline
+	PreValidation([]*Message)
 	// HandleRPC is invoked to process control messages in the RPC envelope.
 	// It is invoked after subscriptions and payload messages have been processed.
 	HandleRPC(*RPC)
@@ -263,8 +275,9 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		val:                   newValidation(),
 		peerFilter:            DefaultPeerFilter,
 		disc:                  &discover{},
-		maxMessageSize:        DefaultMaxMessageSize,
-		peerOutboundQueueSize: 32,
+		softMaxMessageSize:    DefaultSoftMaxMessageSize,
+		hardMaxMessageSize:    DefaultHardMaxMessageSize,
+		peerOutboundQueueSize: DefaultPeerOutboundQueueSize,
 		signID:                h.ID(),
 		signKey:               nil,
 		signPolicy:            LaxSign,
@@ -292,7 +305,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		mySubs:                make(map[string]map[*Subscription]struct{}),
 		myRelays:              make(map[string]int),
 		bitmasks:              make(map[string]map[peer.ID]struct{}),
-		peers:                 make(map[peer.ID]chan *RPC),
+		peers:                 make(map[peer.ID]*rpcQueue),
 		inboundStreams:        make(map[peer.ID]network.Stream),
 		blacklist:             NewMapBlacklist(),
 		blacklistPeer:         make(chan peer.ID),
@@ -518,9 +531,10 @@ func WithRawTracer(tracer RawTracer) Option {
 // another type of locator, such that messages can be fetched on-demand, rather
 // than being pushed proactively. Under this design, you'd use the pubsub layer
 // as a signalling system, rather than a data delivery system.
-func WithMaxMessageSize(maxMessageSize int) Option {
+func WithMaxMessageSize(softMaxMessageSize, hardMaxMessageSize int) Option {
 	return func(ps *PubSub) error {
-		ps.maxMessageSize = maxMessageSize
+		ps.softMaxMessageSize = softMaxMessageSize
+		ps.hardMaxMessageSize = hardMaxMessageSize
 		return nil
 	}
 }
@@ -566,13 +580,11 @@ func WithAppSpecificRpcInspector(inspector func(peer.ID, *RPC) error) Option {
 // processLoop handles all inputs arriving on the channels
 func (p *PubSub) processLoop(ctx context.Context) {
 	defer func() {
-		p.peersMx.Lock()
 		// Clean up go routines.
-		for _, ch := range p.peers {
-			close(ch)
+		for _, q := range p.peers {
+			_ = q.Close()
 		}
 		p.peers = nil
-		p.peersMx.Unlock()
 		p.bitmasks = nil
 		p.seenMessages.Done()
 	}()
@@ -585,9 +597,9 @@ func (p *PubSub) processLoop(ctx context.Context) {
 		case s := <-p.newPeerStream:
 			pid := s.Conn().RemotePeer()
 
-			p.peersMx.RLock()
-			ch, ok := p.peers[pid]
-			p.peersMx.RUnlock()
+			p.peerMx.RLock()
+			q, ok := p.peers[pid]
+			p.peerMx.RUnlock()
 			if !ok {
 				log.Warn("new stream for unknown peer: ", pid)
 				s.Reset()
@@ -596,10 +608,10 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 			if p.blacklist.Contains(pid) {
 				log.Warn("closing stream for blacklisted peer: ", pid)
-				close(ch)
-				p.peersMx.Lock()
+				_ = q.Close()
+				p.peerMx.Lock()
 				delete(p.peers, pid)
-				p.peersMx.Unlock()
+				p.peerMx.Unlock()
 				s.Reset()
 				continue
 			}
@@ -607,9 +619,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			p.rt.AddPeer(pid, s.Protocol())
 
 		case pid := <-p.newPeerError:
-			p.peersMx.Lock()
 			delete(p.peers, pid)
-			p.peersMx.Unlock()
 
 		case <-p.peerDead:
 			p.handleDeadPeers()
@@ -659,14 +669,14 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			log.Infof("Blacklisting peer %s", pid)
 			p.blacklist.Add(pid)
 
-			p.peersMx.RLock()
-			ch, ok := p.peers[pid]
-			p.peersMx.RUnlock()
+			p.peerMx.RLock()
+			q, ok := p.peers[pid]
+			p.peerMx.RUnlock()
 			if ok {
-				close(ch)
-				p.peersMx.Lock()
+				_ = q.Close()
+				p.peerMx.Lock()
 				delete(p.peers, pid)
-				p.peersMx.Unlock()
+				p.peerMx.Unlock()
 				for t, tmap := range p.bitmasks {
 					if _, ok := tmap[pid]; ok {
 						delete(tmap, pid)
@@ -695,7 +705,6 @@ peerloop:
 		}
 
 		var peerset []peer.ID
-		p.peersMx.RLock()
 		for p := range p.peers {
 			_, ok := tmap[p]
 			if !ok {
@@ -703,7 +712,6 @@ peerloop:
 			}
 			peerset = append(peerset, p)
 		}
-		p.peersMx.RUnlock()
 
 		if len(peers) == 0 {
 			peers = peerset
@@ -743,25 +751,30 @@ func (p *PubSub) handlePendingPeers() {
 			continue
 		}
 
-		p.peersMx.RLock()
-		if _, ok := p.peers[pid]; ok {
-			p.peersMx.RUnlock()
+		p.peerMx.RLock()
+		_, ok := p.peers[pid]
+		p.peerMx.RUnlock()
+		if ok {
 			log.Debug("already have connection to peer: ", pid)
 			continue
 		}
-		p.peersMx.RUnlock()
 
 		if p.blacklist.Contains(pid) {
 			log.Warn("ignoring connection from blacklisted peer: ", pid)
 			continue
 		}
 
-		messages := make(chan *RPC, p.peerOutboundQueueSize)
-		messages <- p.getHelloPacket()
-		go p.handleNewPeer(p.ctx, pid, messages)
-		p.peersMx.Lock()
-		p.peers[pid] = messages
-		p.peersMx.Unlock()
+		q := newRPCQueue(p.peerOutboundQueueSize, p.peerOutboundQueueSize)
+		if err := q.Push(p.ctx, p.getHelloPacket(), true); err != nil {
+			log.Debug("error sending hello packet to new peer: ", err)
+			_ = q.Close()
+			continue
+		}
+		go p.handleNewPeer(p.ctx, pid, q)
+
+		p.peerMx.Lock()
+		p.peers[pid] = q
+		p.peerMx.Unlock()
 	}
 }
 
@@ -778,17 +791,17 @@ func (p *PubSub) handleDeadPeers() {
 	p.peerDeadPrioLk.Unlock()
 
 	for pid := range deadPeers {
-		p.peersMx.RLock()
-		ch, ok := p.peers[pid]
-		p.peersMx.RUnlock()
+		p.peerMx.RLock()
+		q, ok := p.peers[pid]
+		p.peerMx.RUnlock()
 		if !ok {
 			continue
 		}
 
-		close(ch)
-		p.peersMx.Lock()
+		_ = q.Close()
+		p.peerMx.Lock()
 		delete(p.peers, pid)
-		p.peersMx.Unlock()
+		p.peerMx.Unlock()
 
 		for t, tmap := range p.bitmasks {
 			if _, ok := tmap[pid]; ok {
@@ -809,12 +822,17 @@ func (p *PubSub) handleDeadPeers() {
 			// still connected, must be a duplicate connection being closed.
 			// we respawn the writer as we need to ensure there is a stream active
 			log.Debugf("peer declared dead but still connected; respawning writer: %s", pid)
-			messages := make(chan *RPC, p.peerOutboundQueueSize)
-			messages <- p.getHelloPacket()
-			p.peersMx.Lock()
-			p.peers[pid] = messages
-			p.peersMx.Unlock()
-			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, messages)
+			q := newRPCQueue(p.peerOutboundQueueSize, p.peerOutboundQueueSize)
+			if err := q.Push(p.ctx, p.getHelloPacket(), true); err != nil {
+				log.Debug("error sending hello packet to new peer: ", err)
+				_ = q.Close()
+				continue
+			}
+
+			p.peerMx.Lock()
+			p.peers[pid] = q
+			p.peerMx.Unlock()
+			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, q)
 		}
 	}
 }
@@ -977,18 +995,15 @@ func (p *PubSub) announce(bitmask []byte, sub bool) {
 	}
 
 	out := rpcWithSubs(subopt)
-	p.peersMx.RLock()
-	for pid, peer := range p.peers {
-		select {
-		case peer <- out:
-			p.tracer.SendRPC(out, pid)
-		default:
+	for pid, q := range p.peers {
+		if err := q.TryPush(p.ctx, out, false); err != nil {
 			log.Infof("Can't send announce message to peer %s: queue full; scheduling retry", pid)
 			p.tracer.DropRPC(out, pid)
 			go p.announceRetry(pid, bitmask, sub)
+			continue
 		}
+		p.tracer.SendRPC(out, pid)
 	}
-	p.peersMx.RUnlock()
 }
 
 func (p *PubSub) announceRetry(pid peer.ID, bitmask []byte, sub bool) {
@@ -1012,9 +1027,9 @@ func (p *PubSub) announceRetry(pid peer.ID, bitmask []byte, sub bool) {
 }
 
 func (p *PubSub) doAnnounceRetry(pid peer.ID, bitmask []byte, sub bool) {
-	p.peersMx.RLock()
-	peer, ok := p.peers[pid]
-	p.peersMx.RUnlock()
+	p.peerMx.RLock()
+	q, ok := p.peers[pid]
+	p.peerMx.RUnlock()
 	if !ok {
 		return
 	}
@@ -1025,14 +1040,13 @@ func (p *PubSub) doAnnounceRetry(pid peer.ID, bitmask []byte, sub bool) {
 	}
 
 	out := rpcWithSubs(subopt)
-	select {
-	case peer <- out:
-		p.tracer.SendRPC(out, pid)
-	default:
+	if err := q.TryPush(p.ctx, out, false); err != nil {
 		log.Infof("Can't send announce message to peer %s: queue full; scheduling retry", pid)
 		p.tracer.DropRPC(out, pid)
 		go p.announceRetry(pid, bitmask, sub)
+		return
 	}
+	p.tracer.SendRPC(out, pid)
 }
 
 // notifySubs sends a given message to all corresponding subscribers.
@@ -1131,6 +1145,9 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 
 	for _, subopt := range subs {
 		t := subopt.GetBitmask()
+		if !p.peerFilter(rpc.from, subopt.Bitmask) {
+			continue
+		}
 
 		if subopt.GetSubscribe() {
 			tmap, ok := p.bitmasks[string(t)]
@@ -1172,13 +1189,21 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		p.tracer.ThrottlePeer(rpc.from)
 
 	case AcceptAll:
+		var toPush []*Message
 		for _, pmsg := range rpc.GetPublish() {
 			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
 				log.Debug("received message in bitmask we didn't subscribe to; ignoring message")
 				continue
 			}
 
-			p.pushMsg(&Message{pmsg, []byte{}, rpc.from, nil, false})
+			msg := &Message{pmsg, []byte{}, rpc.from, nil, false}
+			if p.shouldPush(msg) {
+				toPush = append(toPush, msg)
+			}
+		}
+		p.rt.PreValidation(toPush)
+		for _, msg := range toPush {
+			p.pushMsg(msg)
 		}
 	}
 
@@ -1197,27 +1222,28 @@ func DefaultPeerFilter(pid peer.ID, bitmask []byte) bool {
 	return true
 }
 
-// pushMsg pushes a message performing validation as necessary
-func (p *PubSub) pushMsg(msg *Message) {
+// shouldPush filters a message before validating and pushing it
+// It returns true if the message can be further validated and pushed
+func (p *PubSub) shouldPush(msg *Message) bool {
 	src := msg.ReceivedFrom
 	// reject messages from blacklisted peers
 	if p.blacklist.Contains(src) {
 		log.Debugf("dropping message from blacklisted peer %s", src)
 		p.tracer.RejectMessage(msg, RejectBlacklstedPeer)
-		return
+		return false
 	}
 
 	// even if they are forwarded by good peers
 	if p.blacklist.Contains(msg.GetFrom()) {
 		log.Debugf("dropping message from blacklisted source %s", src)
 		p.tracer.RejectMessage(msg, RejectBlacklistedSource)
-		return
+		return false
 	}
 
 	err := p.checkSigningPolicy(msg)
 	if err != nil {
 		log.Debugf("dropping message from %s: %s", src, err)
-		return
+		return false
 	}
 
 	// reject messages claiming to be from ourselves but not locally published
@@ -1225,15 +1251,23 @@ func (p *PubSub) pushMsg(msg *Message) {
 	if peer.ID(msg.GetFrom()) == self && src != self {
 		log.Debugf("dropping message claiming to be from self but forwarded from %s", src)
 		p.tracer.RejectMessage(msg, RejectSelfOrigin)
-		return
+		return false
 	}
 
 	// have we already seen and validated this message?
 	id := p.idGen.ID(msg)
 	if p.seenMessage(id) {
 		p.tracer.DuplicateMessage(msg)
-		return
+		return false
 	}
+
+	return true
+}
+
+// pushMsg pushes a message performing validation as necessary
+func (p *PubSub) pushMsg(msg *Message) {
+	src := msg.ReceivedFrom
+	id := p.idGen.ID(msg)
 
 	if !p.val.Push(src, msg) {
 		return
@@ -1313,13 +1347,9 @@ func (p *PubSub) PeerScore(pr peer.ID) float64 {
 // Join joins the bitmasks and returns a set of Bitmask handles. Only one Bitmask
 // handle should exist per bit, and Join will error if all the Bitmask handles already exist.
 func (p *PubSub) Join(bitmask []byte, opts ...BitmaskOpt) ([]*Bitmask, error) {
-	ts, news, errs := p.tryJoin(bitmask, opts...)
+	ts, _, errs := p.tryJoin(bitmask, opts...)
 	if len(errs) != 0 {
 		return nil, errors.Join(errs...)
-	}
-
-	if !slices.Contains(news, true) {
-		return nil, fmt.Errorf("bitmask already exists")
 	}
 
 	return ts, nil
@@ -1439,11 +1469,6 @@ func (p *PubSub) GetBitmasks() []string {
 }
 
 func (p *PubSub) Publish(ctx context.Context, bitmask []byte, data []byte, opts ...PubOpt) error {
-	peers := p.ListPeers(bitmask)
-	if len(peers) == 0 {
-		return ErrBitmaskClosed
-	}
-
 	slices := SliceBitmask(bitmask)
 	o := rand.Intn(len(slices))
 	b, _, errs := p.tryJoin(slices[o])

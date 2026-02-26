@@ -14,12 +14,12 @@ import (
 	tls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	webtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/multiformats/go-multiaddr"
-	madns "github.com/multiformats/go-multiaddr-dns"
 )
 
 // DefaultSecurity is the default security option.
@@ -46,6 +46,7 @@ var DefaultTransports = ChainOptions(
 	Transport(quic.NewTransport),
 	Transport(ws.New),
 	Transport(webtransport.New),
+	Transport(libp2pwebrtc.New),
 )
 
 // DefaultPrivateTransports are the default libp2p transports when a PSK is supplied.
@@ -81,9 +82,11 @@ var DefaultListenAddrs = func(cfg *Config) error {
 		"/ip4/0.0.0.0/tcp/0",
 		"/ip4/0.0.0.0/udp/0/quic-v1",
 		"/ip4/0.0.0.0/udp/0/quic-v1/webtransport",
+		"/ip4/0.0.0.0/udp/0/webrtc-direct",
 		"/ip6/::/tcp/0",
 		"/ip6/::/udp/0/quic-v1",
 		"/ip6/::/udp/0/quic-v1/webtransport",
+		"/ip6/::/udp/0/webrtc-direct",
 	}
 	listenAddrs := make([]multiaddr.Multiaddr, 0, len(addrs))
 	for _, s := range addrs {
@@ -121,11 +124,6 @@ var DefaultConnectionManager = func(cfg *Config) error {
 	}
 
 	return cfg.Apply(ConnectionManager(mgr))
-}
-
-// DefaultMultiaddrResolver creates a default connection manager
-var DefaultMultiaddrResolver = func(cfg *Config) error {
-	return cfg.Apply(MultiaddrResolver(madns.DefaultResolver))
 }
 
 // DefaultPrometheusRegisterer configures libp2p to use the default registerer
@@ -180,10 +178,6 @@ var defaults = []struct {
 	{
 		fallback: func(cfg *Config) bool { return cfg.ConnManager == nil },
 		opt:      DefaultConnectionManager,
-	},
-	{
-		fallback: func(cfg *Config) bool { return cfg.MultiaddrResolver == nil },
-		opt:      DefaultMultiaddrResolver,
 	},
 	{
 		fallback: func(cfg *Config) bool { return !cfg.DisableMetrics && cfg.PrometheusRegisterer == nil },

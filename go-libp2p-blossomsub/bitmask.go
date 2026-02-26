@@ -13,8 +13,11 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+// DefaultSubscriptionQueueSize is the default size of the subscription queue.
+const DefaultSubscriptionQueueSize = 16384
+
 // ErrBitmaskClosed is returned if a Bitmask is utilized after it has been closed
-var ErrBitmaskClosed = errors.New("this Bitmask is closed, try opening a new one")
+var ErrBitmaskClosed = errors.New("this bitmask is closed, try opening a new one")
 
 // ErrNilSignKey is returned if a nil private key was provided
 var ErrNilSignKey = errors.New("nil sign key")
@@ -167,7 +170,7 @@ func (t *Bitmask) Subscribe(opts ...SubOpt) (*Subscription, error) {
 	}
 
 	if sub.ch == nil {
-		sub.ch = make(chan *Message, 32)
+		sub.ch = make(chan *Message, DefaultSubscriptionQueueSize)
 	}
 
 	out := make(chan *Subscription, 1)

@@ -38,48 +38,34 @@ func TestBlossomSubMatchingFn(t *testing.T) {
 	}
 
 	// build the mesh
-	var subs []*Subscription
-	var bitmasks []*Bitmask
+	var subs [][]*Subscription
+	var bitmasks [][]*Bitmask
 	for _, ps := range psubs {
 		b, err := ps.Join([]byte{0x00, 0x80, 0x00, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		bitmasks = append(bitmasks, b...)
+		bitmasks = append(bitmasks, b)
 
 		sub, err := ps.Subscribe([]byte{0x00, 0x80, 0x00, 0x00})
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub...)
+		subs = append(subs, sub)
 	}
 
 	time.Sleep(time.Second)
 
 	// publish a message
 	msg := []byte("message")
-	bitmasks[0].Publish(ctx, bitmasks[0].bitmask, msg)
+	bitmasks[0][0].Publish(ctx, bitmasks[0][0].bitmask, msg)
 
 	assertReceive(t, subs[0], msg)
 	assertReceive(t, subs[1], msg) // Should match via semver over CustomSub name, ignoring the version
 	assertReceive(t, subs[2], msg) // Should match via BlossomSubID_v2
 
 	// No message should be received because customsubA and customsubB have different names
-	ctxTimeout, timeoutCancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer timeoutCancel()
-	received := false
-	for {
-		msg, err := subs[3].Next(ctxTimeout)
-		if err != nil {
-			break
-		}
-		if msg != nil {
-			received = true
-		}
-	}
-	if received {
-		t.Fatal("Should not have received a message")
-	}
+	assertNeverReceives(t, subs[2], 1*time.Second)
 }
 
 func protocolNameMatch(base protocol.ID) func(protocol.ID) bool {

@@ -77,6 +77,15 @@ var (
 		},
 		[]string{"outcome", "num_dials"},
 	)
+	dialLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metricNamespace,
+			Name:      "dial_latency_seconds",
+			Help:      "time taken to establish connection with the peer",
+			Buckets:   []float64{0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 2},
+		},
+		[]string{"outcome", "num_dials"},
+	)
 	dialRankingDelay = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: metricNamespace,
@@ -84,30 +93,6 @@ var (
 			Help:      "delay introduced by the dial ranking logic",
 			Buckets:   []float64{0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 2},
 		},
-	)
-	blackHoleFilterState = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricNamespace,
-			Name:      "black_hole_filter_state",
-			Help:      "State of the black hole filter",
-		},
-		[]string{"name"},
-	)
-	blackHoleFilterSuccessFraction = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricNamespace,
-			Name:      "black_hole_filter_success_fraction",
-			Help:      "Fraction of successful dials among the last n requests",
-		},
-		[]string{"name"},
-	)
-	blackHoleFilterNextRequestAllowedAfter = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: metricNamespace,
-			Name:      "black_hole_filter_next_request_allowed_after",
-			Help:      "Number of requests after which the next request will be allowed",
-		},
-		[]string{"name"},
 	)
 	collectors = []prometheus.Collector{
 		connsOpened,
@@ -118,9 +103,7 @@ var (
 		connHandshakeLatency,
 		dialsPerPeer,
 		dialRankingDelay,
-		blackHoleFilterSuccessFraction,
-		blackHoleFilterState,
-		blackHoleFilterNextRequestAllowedAfter,
+		dialLatency,
 	}
 )
 
@@ -129,9 +112,8 @@ type MetricsTracer interface {
 	ClosedConnection(network.Direction, time.Duration, network.ConnectionState, ma.Multiaddr)
 	CompletedHandshake(time.Duration, network.ConnectionState, ma.Multiaddr)
 	FailedDialing(ma.Multiaddr, error, error)
-	DialCompleted(success bool, totalDials int)
+	DialCompleted(success bool, totalDials int, latency time.Duration)
 	DialRankingDelay(d time.Duration)
-	UpdatedBlackHoleFilterState(name string, state blackHoleState, nextProbeAfter int, successFraction float64)
 }
 
 type metricsTracer struct{}
@@ -183,40 +165,37 @@ func appendConnectionState(tags []string, cs network.ConnectionState) []string {
 
 func (m *metricsTracer) OpenedConnection(dir network.Direction, p crypto.PubKey, cs network.ConnectionState, laddr ma.Multiaddr) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = appendConnectionState(*tags, cs)
-	ipv, _ := metricshelper.GetIPVersion(laddr)
-	*tags = append(*tags, ipv)
+	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
 	connsOpened.WithLabelValues(*tags...).Inc()
 
 	*tags = (*tags)[:0]
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = append(*tags, p.Type().String())
 	keyTypes.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) ClosedConnection(dir network.Direction, duration time.Duration, cs network.ConnectionState, laddr ma.Multiaddr) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, metricshelper.GetDirection(dir))
 	*tags = appendConnectionState(*tags, cs)
-	ipv, _ := metricshelper.GetIPVersion(laddr)
-	*tags = append(*tags, ipv)
+	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
 	connsClosed.WithLabelValues(*tags...).Inc()
 	connDuration.WithLabelValues(*tags...).Observe(duration.Seconds())
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) CompletedHandshake(t time.Duration, cs network.ConnectionState, laddr ma.Multiaddr) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = appendConnectionState(*tags, cs)
-	ipv, _ := metricshelper.GetIPVersion(laddr)
-	*tags = append(*tags, ipv)
+	*tags = append(*tags, metricshelper.GetIPVersion(laddr))
 	connHandshakeLatency.WithLabelValues(*tags...).Observe(t.Seconds())
-	metricshelper.PutStringSlice(tags)
 }
 
 func (m *metricsTracer) FailedDialing(addr ma.Multiaddr, dialErr error, cause error) {
@@ -246,16 +225,16 @@ func (m *metricsTracer) FailedDialing(addr ma.Multiaddr, dialErr error, cause er
 	}
 
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 
 	*tags = append(*tags, transport, e)
-	ipv, _ := metricshelper.GetIPVersion(addr)
-	*tags = append(*tags, ipv)
+	*tags = append(*tags, metricshelper.GetIPVersion(addr))
 	dialError.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
 }
 
-func (m *metricsTracer) DialCompleted(success bool, totalDials int) {
+func (m *metricsTracer) DialCompleted(success bool, totalDials int, latency time.Duration) {
 	tags := metricshelper.GetStringSlice()
+	defer metricshelper.PutStringSlice(tags)
 	if success {
 		*tags = append(*tags, "success")
 	} else {
@@ -271,21 +250,9 @@ func (m *metricsTracer) DialCompleted(success bool, totalDials int) {
 	}
 	*tags = append(*tags, numDials)
 	dialsPerPeer.WithLabelValues(*tags...).Inc()
-	metricshelper.PutStringSlice(tags)
+	dialLatency.WithLabelValues(*tags...).Observe(latency.Seconds())
 }
 
 func (m *metricsTracer) DialRankingDelay(d time.Duration) {
 	dialRankingDelay.Observe(d.Seconds())
-}
-
-func (m *metricsTracer) UpdatedBlackHoleFilterState(name string, state blackHoleState,
-	nextProbeAfter int, successFraction float64) {
-	tags := metricshelper.GetStringSlice()
-
-	*tags = append(*tags, name)
-
-	blackHoleFilterState.WithLabelValues(*tags...).Set(float64(state))
-	blackHoleFilterSuccessFraction.WithLabelValues(*tags...).Set(successFraction)
-	blackHoleFilterNextRequestAllowedAfter.WithLabelValues(*tags...).Set(float64(nextProbeAfter))
-	metricshelper.PutStringSlice(tags)
 }

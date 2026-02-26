@@ -349,13 +349,13 @@ func TestValidateAssortedOptions(t *testing.T) {
 
 		bitmasks1[i].Publish(ctx, bitmasks1[i].bitmask, msg)
 		for _, sub := range subs1 {
-			assertReceive(t, sub, msg)
+			assertReceive(t, []*Subscription{sub}, msg)
 		}
 		msg = []byte(fmt.Sprintf("message2 %d", i))
 
 		bitmasks2[i].Publish(ctx, bitmasks2[i].bitmask, msg)
 		for _, sub := range subs2 {
-			assertReceive(t, sub, msg)
+			assertReceive(t, []*Subscription{sub}, msg)
 		}
 	}
 }

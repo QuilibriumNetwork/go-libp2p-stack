@@ -170,7 +170,7 @@ func WithPeerScoreInspect(inspect interface{}, period time.Duration) Option {
 		case ExtendedPeerScoreInspectFn:
 			gs.score.inspectEx = i
 		default:
-			return fmt.Errorf("unknown peer score insector type: %v", inspect)
+			return fmt.Errorf("unknown peer score inspector type: %v", inspect)
 		}
 
 		gs.score.inspectPeriod = period

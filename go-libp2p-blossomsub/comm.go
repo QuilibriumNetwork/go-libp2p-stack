@@ -55,11 +55,30 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 	p.inboundStreams[peer] = s
 	p.inboundStreamsMx.Unlock()
 
-	r := msgio.NewVarintReaderSize(s, p.maxMessageSize)
-	for {
-		msgbytes, err := r.ReadMsg()
+	r := msgio.NewVarintReaderSize(s, p.hardMaxMessageSize)
+	read := func() (*RPC, error) {
+		n, err := r.NextMsgLen()
 		if err != nil {
-			r.ReleaseMsg(msgbytes)
+			return nil, err
+		}
+		if n == 0 {
+			_, err := r.Read(nil)
+			return nil, err
+		}
+		buf := poolGet(n, p.softMaxMessageSize)
+		defer poolPut(buf, p.softMaxMessageSize)
+		if _, err := r.Read(buf); err != nil {
+			return nil, err
+		}
+		rpc := new(pb.RPC)
+		if err := rpc.Unmarshal(buf); err != nil {
+			return nil, err
+		}
+		return &RPC{RPC: rpc, from: peer}, nil
+	}
+	for {
+		rpc, err := read()
+		if err != nil {
 			if err != io.EOF {
 				s.Reset()
 				log.Debugf("error reading rpc from %s: %s", s.Conn().RemotePeer(), err)
@@ -76,27 +95,10 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 			p.inboundStreamsMx.Unlock()
 			return
 		}
-		if len(msgbytes) == 0 {
+		if rpc == nil {
 			continue
 		}
 
-		rpc := &RPC{
-			RPC: new(pb.RPC),
-		}
-		err = rpc.Unmarshal(msgbytes)
-		r.ReleaseMsg(msgbytes)
-		if err != nil {
-			s.Reset()
-			log.Warnf("bogus rpc from %s: %s", s.Conn().RemotePeer(), err)
-			p.inboundStreamsMx.Lock()
-			if p.inboundStreams[peer] == s {
-				delete(p.inboundStreams, peer)
-			}
-			p.inboundStreamsMx.Unlock()
-			return
-		}
-
-		rpc.from = peer
 		select {
 		case p.incoming <- rpc:
 		case <-p.ctx.Done():
@@ -125,7 +127,7 @@ func (p *PubSub) notifyPeerDead(pid peer.ID) {
 	}
 }
 
-func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan *RPC) {
+func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, q *rpcQueue) {
 	s, err := p.host.NewStream(p.ctx, pid, p.rt.Protocols()...)
 	if err != nil {
 		log.Debug("opening new stream to peer: ", err, pid)
@@ -138,7 +140,7 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan
 		return
 	}
 
-	go p.handleSendingMessages(ctx, s, outgoing)
+	go p.handleSendingMessages(ctx, s, q)
 	go p.handlePeerDead(s)
 	select {
 	case p.newPeerStream <- s:
@@ -146,10 +148,10 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan
 	}
 }
 
-func (p *PubSub) handleNewPeerWithBackoff(ctx context.Context, pid peer.ID, backoff time.Duration, outgoing <-chan *RPC) {
+func (p *PubSub) handleNewPeerWithBackoff(ctx context.Context, pid peer.ID, backoff time.Duration, q *rpcQueue) {
 	select {
 	case <-time.After(backoff):
-		p.handleNewPeer(ctx, pid, outgoing)
+		p.handleNewPeer(ctx, pid, q)
 	case <-ctx.Done():
 		return
 	}
@@ -167,39 +169,29 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 	p.notifyPeerDead(pid)
 }
 
-func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing <-chan *RPC) {
+func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, q *rpcQueue) {
+	writeRPC := func(rpc *RPC) error {
+		size := uint64(rpc.Size())
+		buf := poolGet(varint.UvarintSize(size)+int(size), p.softMaxMessageSize)
+		defer poolPut(buf, p.softMaxMessageSize)
+		n := binary.PutUvarint(buf, size)
+		_, err := rpc.MarshalTo(buf[n:])
+		if err != nil {
+			return err
+		}
+		_, err = s.Write(buf)
+		return err
+	}
+	defer s.Close()
+	defer s.Reset()
 	for {
-		select {
-		case rpc, ok := <-outgoing:
-			if !ok {
-				s.Close()
-				return
-			}
-
-			size := uint64(rpc.Size())
-
-			buf := pool.Get(varint.UvarintSize(size) + int(size))
-
-			n := binary.PutUvarint(buf, size)
-			_, err := rpc.MarshalTo(buf[n:])
-			if err != nil {
-				s.Reset()
-				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
-				s.Close()
-				return
-			}
-
-			_, err = s.Write(buf)
-			if err != nil {
-				s.Reset()
-				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
-				s.Close()
-				return
-			}
-
-			pool.Put(buf)
-		case <-ctx.Done():
-			s.Close()
+		rpc, err := q.Pop(ctx)
+		if err != nil {
+			log.Debugf("pop RPC from queue: %s", err)
+			return
+		}
+		if err := writeRPC(rpc); err != nil {
+			log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
 			return
 		}
 	}
@@ -221,15 +213,17 @@ func rpcWithControl(msgs []*pb.Message,
 	ihave []*pb.ControlIHave,
 	iwant []*pb.ControlIWant,
 	graft []*pb.ControlGraft,
-	prune []*pb.ControlPrune) *RPC {
+	prune []*pb.ControlPrune,
+	idontwant []*pb.ControlIDontWant) *RPC {
 	return &RPC{
 		RPC: &pb.RPC{
 			Publish: msgs,
 			Control: &pb.ControlMessage{
-				Ihave: ihave,
-				Iwant: iwant,
-				Graft: graft,
-				Prune: prune,
+				Ihave:     ihave,
+				Iwant:     iwant,
+				Graft:     graft,
+				Prune:     prune,
+				Idontwant: idontwant,
 			},
 		},
 	}
@@ -237,7 +231,23 @@ func rpcWithControl(msgs []*pb.Message,
 
 func copyRPC(rpc *RPC) *RPC {
 	res := new(RPC)
-	copiedRPC := (proto.Clone(rpc.RPC)).(*pb.RPC)
-	res.RPC = copiedRPC
+	*res = *rpc
+	res.RPC = (proto.Clone(rpc.RPC)).(*pb.RPC)
 	return res
+}
+
+// poolGet returns a buffer of length n from the pool if n < limit, otherwise it allocates a new buffer.
+func poolGet(n int, limit int) []byte {
+	if n >= limit {
+		return make([]byte, n)
+	}
+	return pool.Get(n)
+}
+
+// poolPut returns a buffer to the pool if its length is less than limit.
+func poolPut(buf []byte, limit int) {
+	if len(buf) >= limit {
+		return
+	}
+	pool.Put(buf)
 }
